@@ -7,7 +7,7 @@ import type { Service } from '../types';
 const blank = { id: '', name: '', icon: '🏥', description: '', estimatedServiceTime: 3, active: true };
 
 export default function Services() {
-  const { services, queues, run, setToast } = useData();
+  const { services, queues, run, setToast, user } = useData();
   const [form, setForm] = useState<typeof blank & { order?: number }>(blank);
   const [editing, setEditing] = useState(false);
 
@@ -35,14 +35,14 @@ export default function Services() {
                     <td><b>{s.name}</b><div className="muted small">{s.description}</div></td>
                     <td>{s.estimatedServiceTime} min</td>
                     <td>{q ? <QueueStatusBadge status={q.status} /> : '—'}</td>
-                    <td><button className="btn sm ghost" onClick={() => edit(s)}>Edit</button></td>
+                    <td>{user?.role === 'ADMIN' && <button className="btn sm ghost" onClick={() => edit(s)}>Edit</button>}</td>
                   </tr>
                 );
               })}
             </tbody>
           </table>
         </div>
-        <form className="card form" onSubmit={submit}>
+        {user?.role === 'ADMIN' ? <form className="card form" onSubmit={submit}>
           <h3>{editing ? `Edit ${form.name}` : 'Add a service'}</h3>
           <label>Name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Sports Complex" /></label>
           <label>Icon (emoji)<input value={form.icon} onChange={(e) => setForm({ ...form, icon: e.target.value })} maxLength={4} /></label>
@@ -53,7 +53,7 @@ export default function Services() {
             <button className="btn primary">{editing ? 'Save changes' : 'Add service'}</button>
             {editing && <button type="button" className="btn ghost" onClick={() => { setForm(blank); setEditing(false); }}>Cancel</button>}
           </div>
-        </form>
+        </form> : <div className="card"><h3>Service settings</h3><p className="muted">Only administrators can add or edit campus services.</p></div>}
       </div>
     </>
   );

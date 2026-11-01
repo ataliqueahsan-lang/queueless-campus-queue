@@ -18,7 +18,7 @@ const FUTURE = [
 ];
 
 export default function Settings() {
-  const { crowd, run } = useData();
+  const { crowd, run, user } = useData();
   const [low, setLow] = useState(crowd.lowMax);
   const [mod, setMod] = useState(crowd.moderateMax);
   useEffect(() => { setLow(crowd.lowMax); setMod(crowd.moderateMax); }, [crowd.lowMax, crowd.moderateMax]);
@@ -34,13 +34,13 @@ export default function Settings() {
           <label>Low: up to (people)<input type="number" min={0} value={low} onChange={(e) => setLow(Number(e.target.value))} /></label>
           <label>Moderate: up to (people)<input type="number" min={1} value={mod} onChange={(e) => setMod(Number(e.target.value))} /></label>
           {!valid && <div className="banner error">Moderate must be greater than Low.</div>}
-          <button className="btn primary" disabled={!valid} onClick={() => run(() => repo.saveSettings({ lowMax: low, moderateMax: mod }), 'Thresholds saved. The student app updates instantly.')}>Save thresholds</button>
+          {user?.role === 'ADMIN' ? <button className="btn primary" disabled={!valid} onClick={() => run(() => repo.saveSettings({ lowMax: low, moderateMax: mod }), 'Thresholds saved. The student app updates instantly.')}>Save thresholds</button> : <p className="muted small">Only administrators can change crowd thresholds.</p>}
         </div>
         <div className="card form">
           <h3>Demo data</h3>
           <p className="muted small">Creates the four sample services with sample queues and sample tokens. Use it before a presentation, or to reset the demo.
             {repo.mode === 'demo' ? ' (Demo mode: resets the in-memory data.)' : ' This overwrites the sample services and queues in your Firebase project.'}</p>
-          <button className="btn primary" onClick={() => { if (confirm('Load / reset the sample data?')) run(() => repo.seedDemoData(), 'Demo data loaded'); }}>Load demo data</button>
+          {user?.role === 'ADMIN' && <button className="btn primary" onClick={() => { if (confirm('Load / reset the sample data?')) run(() => repo.seedDemoData(), 'Demo data loaded'); }}>Load demo data</button>}
           <p className="muted small">Mode: <b>{repo.mode === 'demo' ? 'Demo (no Firebase)' : 'Firebase (live)'}</b></p>
         </div>
       </div>

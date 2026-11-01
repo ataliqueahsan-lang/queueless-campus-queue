@@ -2,12 +2,13 @@ import {
   createUserWithEmailAndPassword, onAuthStateChanged, signInWithEmailAndPassword, signOut,
 } from 'firebase/auth';
 import {
-  collection, doc, getDoc, onSnapshot, query, runTransaction, serverTimestamp, setDoc, Timestamp, updateDoc,
+  collection, doc, getDoc, onSnapshot, query, serverTimestamp, setDoc, Timestamp, updateDoc,
   where, writeBatch, type DocumentData, type DocumentSnapshot,
 } from 'firebase/firestore';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 import { DEFAULT_CROWD } from '@/types';
 import type { AppNotification, AppUser, CrowdSettings, Queue, Service, Token } from '@/types';
-import { QueueError, applyJoin, applyRemove, lockDocId, tokenDocId } from '@/utils/queueLogic';
+import { QueueError } from '@/utils/queueLogic';
 import { fb } from './firebase';
 import type { Repo, Unsub } from './repo';
 
@@ -41,10 +42,15 @@ export class FirebaseRepo implements Repo {
       try {
         const snap = await getDoc(doc(fb().db, 'users', fu.uid));
         const d = snap.data();
-        cb({ uid: fu.uid, name: d?.name ?? fu.displayName ?? 'Student', studentId: d?.studentId ?? '', email: fu.email ?? '', role: d?.role ?? 'STUDENT' }, false);
+        if (!snap.exists() || d?.role !== 'STUDENT') {
+          await signOut(fb().auth);
+          return cb(null, false);
+        }
+        cb({ uid: fu.uid, name: d.name ?? fu.displayName ?? 'Student', studentId: d.studentId ?? '', email: fu.email ?? '', role: 'STUDENT' }, false);
       } catch {
-        // profile could not be loaded (e.g. offline): still let the student in
-        cb({ uid: fu.uid, name: fu.displayName ?? 'Student', studentId: '', email: fu.email ?? '', role: 'STUDENT' }, false);
+        // Fail closed: role-sensitive reads and functions require a verified profile.
+        await signOut(fb().auth).catch(() => undefined);
+        cb(null, false);
       }
     });
   }
@@ -54,7 +60,7 @@ export class FirebaseRepo implements Repo {
   async register({ name, studentId, email, password }: { name: string; studentId: string; email: string; password: string }) {
     const cred = await createUserWithEmailAndPassword(fb().auth, email, password);
     // role is always STUDENT here; the security rules refuse anything else.
-    await setDoc(doc(fb().db, 'users', cred.user.uid), { name, studentId, email, role: 'STUDENT', createdAt: serverTimestamp() });
+    await setDoc(doc(fb().db, 'users', cred.user.uid), { name, studentId, email: cred.user.email ?? email, role: 'STUDENT', createdAt: serverTimestamp() });
   }
   signOut() { return signOut(fb().auth); }
   async updateProfile(uid: string, p: { name: string; studentId: string }) { await updateDoc(doc(fb().db, 'users', uid), p); }
@@ -93,54 +99,25 @@ export class FirebaseRepo implements Repo {
    * hold two active tokens for the same service.
    */
   async joinQueue(user: AppUser, serviceId: string): Promise<Token> {
-    const { db } = fb();
-    return runTransaction(db, async (tx) => {
-      const qRef = doc(db, 'queues', serviceId);
-      const lockRef = doc(db, 'activeTokens', lockDocId(user.uid, serviceId));
-      const svcRef = doc(db, 'services', serviceId);
-      const [qs, lock, svc] = await Promise.all([tx.get(qRef), tx.get(lockRef), tx.get(svcRef)]);
-      if (!qs.exists()) throw new QueueError('NOT_FOUND');
-      if (lock.exists()) throw new QueueError('DUPLICATE');
-      const { queue, tokenNumber } = applyJoin(mapQueue(qs));
-      const id = tokenDocId(serviceId, tokenNumber);
-      const serviceName = (svc.data()?.name as string) ?? serviceId;
-      const positionAtJoin = queue.waitingNumbers.length;
-
-      tx.update(qRef, { nextToken: queue.nextToken, waitingNumbers: queue.waitingNumbers });
-      tx.set(doc(db, 'tokens', id), {
-        tokenNumber, serviceId, serviceName, userId: user.uid, userName: user.name, status: 'WAITING', positionAtJoin,
-        createdAt: serverTimestamp(), calledAt: null, completedAt: null,
-      });
-      tx.set(lockRef, { userId: user.uid, serviceId, tokenId: id, createdAt: serverTimestamp() });
-      tx.set(doc(collection(db, 'queue_events')), { serviceId, type: 'JOINED', tokenNumber, actorId: user.uid, createdAt: serverTimestamp() });
-      return {
-        id, tokenNumber, serviceId, serviceName, userId: user.uid, userName: user.name, status: 'WAITING' as const,
-        positionAtJoin, createdAt: Date.now(), calledAt: null, completedAt: null,
-      };
-    });
+    const { auth } = fb();
+    if (auth.currentUser?.uid !== user.uid) throw new QueueError('NOT_FOUND');
+    const invoke = httpsCallable<{ serviceId: string }, Omit<Token, 'createdAt'> & { createdAt: number }>(getFunctions(), 'joinQueue');
+    return (await invoke({ serviceId })).data;
   }
 
   async leaveQueue(token: Token) {
-    const { db } = fb();
-    await runTransaction(db, async (tx) => {
-      const tRef = doc(db, 'tokens', token.id);
-      const qRef = doc(db, 'queues', token.serviceId);
-      const [ts, qs] = await Promise.all([tx.get(tRef), tx.get(qRef)]);
-      if (!ts.exists() || !qs.exists()) throw new QueueError('NOT_FOUND');
-      if (ts.data().status !== 'WAITING') throw new QueueError('BAD_TRANSITION');
-      tx.update(qRef, {
-        waitingNumbers: applyRemove(mapQueue(qs), token.tokenNumber).waitingNumbers,
-        lastStudentCancelledTokenNumber: token.tokenNumber,
-      });
-      tx.update(tRef, { status: 'CANCELLED', completedAt: serverTimestamp() });
-      tx.delete(doc(db, 'activeTokens', lockDocId(token.userId, token.serviceId)));
-      tx.set(doc(collection(db, 'queue_events')), { serviceId: token.serviceId, type: 'CANCELLED', tokenNumber: token.tokenNumber, actorId: token.userId, createdAt: serverTimestamp() });
-    });
+    const invoke = httpsCallable<{ serviceId: string; tokenNumber: number }, { ok: boolean }>(getFunctions(), 'cancelQueue');
+    await invoke({ serviceId: token.serviceId, tokenNumber: token.tokenNumber });
   }
 
   async pushNotification(uid: string, id: string, n: { title: string; body: string; type: string }) {
-    // Deterministic id: if it already exists the write is rejected by the rules, which is fine (no duplicates).
-    await setDoc(doc(fb().db, 'notifications', id), { userId: uid, ...n, read: false, createdAt: serverTimestamp() });
+    const { auth } = fb();
+    if (auth.currentUser?.uid !== uid) throw new QueueError('NOT_FOUND');
+    const suffix = `_${n.type}`;
+    if (!id.endsWith(suffix)) throw new QueueError('BAD_TRANSITION');
+    const tokenId = id.slice(0, -suffix.length);
+    const invoke = httpsCallable<{ tokenId: string; kind: string }, { ok: boolean; skipped?: boolean }>(getFunctions(), 'createNotification');
+    await invoke({ tokenId, kind: n.type });
   }
   async markRead(_uid: string, ids: string[]) {
     const batch = writeBatch(fb().db);

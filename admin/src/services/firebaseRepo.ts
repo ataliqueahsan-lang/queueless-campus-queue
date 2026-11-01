@@ -1,15 +1,13 @@
 import {
-  collection, doc, getDocs, onSnapshot, orderBy, query, runTransaction, serverTimestamp, setDoc,
-  Timestamp, where, writeBatch, type DocumentData, type DocumentSnapshot,
+  collection, doc, getDoc, onSnapshot, orderBy, query,
+  Timestamp, where, type DocumentData, type DocumentSnapshot,
 } from 'firebase/firestore';
 import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from 'firebase/auth';
-import { getDoc } from 'firebase/firestore';
+import { getFunctions, httpsCallable } from 'firebase/functions';
 import { DEFAULT_CROWD } from '../types';
 import type { AppUser, CrowdSettings, Queue, QueueStatus, Service, Token, TokenStatus } from '../types';
-import { QueueError, applyCall, applyRemove, canTransition, lockDocId, tokenDocId } from '../utils/queueLogic';
 import { fb } from './firebase';
 import type { AdminRepo, ServiceInput, Unsub } from './repo';
-import { SEED_QUEUES, SEED_SERVICES, buildSeedTokens } from './seedData';
 
 const ms = (v: unknown, fallback: number | null = null): number | null =>
   v && typeof (v as Timestamp).toMillis === 'function' ? (v as Timestamp).toMillis() : fallback;
@@ -43,7 +41,7 @@ export class FirebaseAdminRepo implements AdminRepo {
         if (d && (d.role === 'STAFF' || d.role === 'ADMIN')) {
           cb({ uid: fu.uid, name: d.name ?? 'Staff', studentId: d.studentId ?? '', email: fu.email ?? '', role: d.role }, false);
         } else { await signOut(fb().auth); cb(null, false); }
-      } catch { cb(null, false); }
+      } catch { await signOut(fb().auth); cb(null, false); }
     });
   }
 
@@ -80,89 +78,34 @@ export class FirebaseAdminRepo implements AdminRepo {
   }
 
   async callToken(serviceId: string, tokenNumber: number | null, staff: AppUser) {
-    const { db } = fb();
-    await runTransaction(db, async (tx) => {
-      const qRef = doc(db, 'queues', serviceId);
-      const qs = await tx.get(qRef);
-      if (!qs.exists()) throw new QueueError('NOT_FOUND');
-      const q = mapQueue(qs);
-      const { queue, target } = applyCall(q, tokenNumber ?? undefined);
-      const tRef = doc(db, 'tokens', tokenDocId(serviceId, target));
-      const ts = await tx.get(tRef);
-      if (!ts.exists()) throw new QueueError('NOT_FOUND');
-      const prevRef = q.currentToken > 0 ? doc(db, 'tokens', tokenDocId(serviceId, q.currentToken)) : null;
-      const ps = prevRef ? await tx.get(prevRef) : null;
-
-      tx.update(qRef, { currentToken: queue.currentToken, waitingNumbers: queue.waitingNumbers });
-      tx.update(tRef, { status: 'CALLED', calledAt: serverTimestamp() });
-      // The counter moved on: the previously called/serving token is finished.
-      if (prevRef && ps && ps.exists() && ['CALLED', 'SERVING'].includes(ps.data().status)) {
-        tx.update(prevRef, { status: 'COMPLETED', completedAt: serverTimestamp() });
-        tx.delete(doc(db, 'activeTokens', lockDocId(ps.data().userId, serviceId)));
-      }
-      tx.set(doc(collection(db, 'queue_events')), {
-        serviceId, type: 'CALLED', tokenNumber: target, actorId: staff.uid, createdAt: serverTimestamp(),
-      });
-    });
+    void staff;
+    const invoke = httpsCallable(getFunctions(), 'callToken');
+    await invoke({ serviceId, tokenNumber });
   }
 
   async setTokenStatus(token: Token, status: TokenStatus, staff: AppUser) {
-    const { db } = fb();
-    await runTransaction(db, async (tx) => {
-      const tRef = doc(db, 'tokens', token.id);
-      const qRef = doc(db, 'queues', token.serviceId);
-      const [ts, qs] = await Promise.all([tx.get(tRef), tx.get(qRef)]);
-      if (!ts.exists() || !qs.exists()) throw new QueueError('NOT_FOUND');
-      const cur = ts.data().status as TokenStatus;
-      if (!canTransition(cur, status)) throw new QueueError('BAD_TRANSITION');
-      const patch: Record<string, unknown> = { status };
-      if (status === 'CALLED') patch.calledAt = serverTimestamp();
-      if (['COMPLETED', 'SKIPPED', 'CANCELLED'].includes(status)) patch.completedAt = serverTimestamp();
-      if (cur === 'WAITING' && (status === 'SKIPPED' || status === 'CANCELLED')) {
-        tx.update(qRef, { waitingNumbers: applyRemove(mapQueue(qs), token.tokenNumber).waitingNumbers });
-      }
-      tx.update(tRef, patch);
-      if (['COMPLETED', 'SKIPPED', 'CANCELLED'].includes(status)) {
-        tx.delete(doc(db, 'activeTokens', lockDocId(ts.data().userId, token.serviceId)));
-      }
-      tx.set(doc(collection(db, 'queue_events')), {
-        serviceId: token.serviceId, type: status, tokenNumber: token.tokenNumber, actorId: staff.uid, createdAt: serverTimestamp(),
-      });
-    });
+    void staff;
+    const invoke = httpsCallable(getFunctions(), 'setTokenStatus');
+    await invoke({ serviceId: token.serviceId, tokenNumber: token.tokenNumber, status });
   }
 
   async setQueueStatus(serviceId: string, status: QueueStatus) {
-    await setDoc(doc(fb().db, 'queues', serviceId), { status }, { merge: true });
+    const invoke = httpsCallable(getFunctions(), 'setQueueStatus');
+    await invoke({ serviceId, status });
   }
 
   async saveService(s: ServiceInput) {
-    const { db } = fb();
-    const batch = writeBatch(db);
-    const qRef = doc(db, 'queues', s.id);
-    const existing = await getDoc(qRef);
-    const all = await getDocs(collection(db, 'services'));
-    batch.set(doc(db, 'services', s.id), { ...s, order: s.order ?? all.size + 1 }, { merge: true });
-    if (existing.exists()) batch.update(qRef, { estimatedServiceTime: s.estimatedServiceTime });
-    else batch.set(qRef, { serviceId: s.id, currentToken: 0, nextToken: 1, status: 'OPEN', estimatedServiceTime: s.estimatedServiceTime, waitingNumbers: [] });
-    await batch.commit();
+    const invoke = httpsCallable(getFunctions(), 'saveService');
+    await invoke(s);
   }
 
-  async saveSettings(c: CrowdSettings) { await setDoc(doc(fb().db, 'settings', 'crowd'), c); }
+  async saveSettings(c: CrowdSettings) {
+    const invoke = httpsCallable(getFunctions(), 'saveSettings');
+    await invoke(c);
+  }
 
   async seedDemoData() {
-    const { db } = fb();
-    const batch = writeBatch(db);
-    SEED_SERVICES.forEach((s) => batch.set(doc(db, 'services', s.id), s));
-    SEED_QUEUES.forEach((q) => batch.set(doc(db, 'queues', q.serviceId), q));
-    buildSeedTokens(SEED_SERVICES, SEED_QUEUES).forEach((t) => {
-      const { id, ...rest } = t;
-      batch.set(doc(db, 'tokens', id), {
-        ...rest, createdAt: Timestamp.fromMillis(t.createdAt),
-        calledAt: t.calledAt ? Timestamp.fromMillis(t.calledAt) : null,
-        completedAt: t.completedAt ? Timestamp.fromMillis(t.completedAt) : null,
-      });
-    });
-    batch.set(doc(db, 'settings', 'crowd'), DEFAULT_CROWD);
-    await batch.commit();
+    const invoke = httpsCallable(getFunctions(), 'seedDemoData');
+    await invoke({});
   }
 }

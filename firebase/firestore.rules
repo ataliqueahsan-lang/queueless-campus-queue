@@ -1,96 +1,79 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-
     function signedIn() { return request.auth != null; }
-    function isStaff() {
+    function role() {
       return signedIn()
         && exists(/databases/$(database)/documents/users/$(request.auth.uid))
-        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role in ['STAFF', 'ADMIN'];
+        ? get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role
+        : 'NONE';
     }
-    function isOwnWaitingTokenCancelled(serviceId, tokenNumber) {
-      let tokenPath = /databases/$(database)/documents/tokens/$(serviceId + '_' + string(tokenNumber));
-      return exists(tokenPath)
-        && existsAfter(tokenPath)
-        && get(tokenPath).data.userId == request.auth.uid
-        && get(tokenPath).data.status == 'WAITING'
-        && getAfter(tokenPath).data.userId == request.auth.uid
-        && getAfter(tokenPath).data.status == 'CANCELLED';
-    }
+    function isStaff() { return role() in ['STAFF', 'ADMIN']; }
+    function isAdmin() { return role() == 'ADMIN'; }
 
-    // Profiles. Students can create/edit only their own profile and can never change their role.
+    // Clients may create student profiles, but may only change public profile fields.
+    // Staff roles are assigned only by trusted server-side provisioning.
     match /users/{uid} {
-      allow read: if signedIn() && (request.auth.uid == uid || isStaff());
-      allow create: if signedIn() && request.auth.uid == uid && request.resource.data.role == 'STUDENT';
-      allow update: if signedIn() && request.auth.uid == uid
-        && request.resource.data.role == resource.data.role;
-      allow update, delete: if isStaff();
+      allow read: if signedIn() && (request.auth.uid == uid || isAdmin() || (isStaff() && resource.data.role == 'STUDENT'));
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'studentId', 'email', 'role', 'createdAt'])
+        && request.resource.data.keys().hasAll(['name', 'studentId', 'email', 'role', 'createdAt'])
+        && request.resource.data.role == 'STUDENT'
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.studentId is string
+        && request.resource.data.studentId.size() >= 3
+        && request.resource.data.studentId.size() <= 50
+        && request.resource.data.createdAt == request.time;
+      allow update: if signedIn()
+        && request.auth.uid == uid
+        && resource.data.role == 'STUDENT'
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name', 'studentId'])
+        && request.resource.data.name is string
+        && request.resource.data.name.size() >= 2
+        && request.resource.data.name.size() <= 100
+        && request.resource.data.studentId is string
+        && request.resource.data.studentId.size() >= 3
+        && request.resource.data.studentId.size() <= 50;
+      allow delete: if false;
     }
 
+    // All operational writes go through authenticated callable Cloud Functions.
     match /services/{id} {
       allow read: if signedIn();
-      allow write: if isStaff();
+      allow write: if false;
     }
-
-    match /settings/{id} {
-      allow read: if signedIn();
-      allow write: if isStaff();
-    }
-
-    // Queue counters. Staff can do anything. A student may join, or cancel only their own
-    // waiting token in the same transaction as removing that exact number from the queue.
     match /queues/{id} {
       allow read: if signedIn();
-      allow write: if isStaff();
-      allow update: if signedIn() && (
-        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['nextToken', 'waitingNumbers'])
-          && resource.data.status == 'OPEN'
-          && request.resource.data.nextToken == resource.data.nextToken + 1
-          && request.resource.data.waitingNumbers.size() == resource.data.waitingNumbers.size() + 1
-          && request.resource.data.waitingNumbers[request.resource.data.waitingNumbers.size() - 1] == resource.data.nextToken)
-        ||
-        (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['waitingNumbers', 'lastStudentCancelledTokenNumber'])
-          && request.resource.data.waitingNumbers.size() == resource.data.waitingNumbers.size() - 1
-          && request.resource.data.diff(resource.data).affectedKeys().hasAll(['lastStudentCancelledTokenNumber', 'waitingNumbers'])
-          && request.resource.data.lastStudentCancelledTokenNumber is int
-          && request.resource.data.lastStudentCancelledTokenNumber in resource.data.waitingNumbers
-          && request.resource.data.waitingNumbers == resource.data.waitingNumbers.removeAll([request.resource.data.lastStudentCancelledTokenNumber])
-          && isOwnWaitingTokenCancelled(resource.data.serviceId, request.resource.data.lastStudentCancelledTokenNumber))
-      );
+      allow write: if false;
     }
-
-    // Tokens: doc id is "<serviceId>_<tokenNumber>", so a number can only ever be created once.
     match /tokens/{id} {
       allow read: if signedIn() && (resource.data.userId == request.auth.uid || isStaff());
-      allow create: if signedIn() && request.resource.data.userId == request.auth.uid
-        && request.resource.data.status == 'WAITING';
-      allow write: if isStaff();
-      allow update: if signedIn() && resource.data.userId == request.auth.uid
-        && resource.data.status == 'WAITING'
-        && request.resource.data.status == 'CANCELLED'
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'completedAt']);
+      allow write: if false;
     }
-
-    // One doc per (student, service) that exists only while the student has an active token.
-    // Creating it inside the join transaction is what blocks duplicate active tokens.
     match /activeTokens/{lockId} {
-      allow read: if signedIn() && (lockId.matches(request.auth.uid + '_.*') || isStaff());
-      allow create: if signedIn() && lockId.matches(request.auth.uid + '_.*')
-        && request.resource.data.userId == request.auth.uid;
-      allow delete: if signedIn() && lockId.matches(request.auth.uid + '_.*');
-      allow write: if isStaff();
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow write: if false;
     }
-
     match /notifications/{id} {
-      allow read: if signedIn() && (resource.data.userId == request.auth.uid || isStaff());
-      allow create: if signedIn() && (request.resource.data.userId == request.auth.uid || isStaff());
-      allow update: if signedIn() && resource.data.userId == request.auth.uid
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read']);
+      allow read: if signedIn() && resource.data.userId == request.auth.uid;
+      allow update: if signedIn()
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['read'])
+        && request.resource.data.read == true;
+      allow create, delete: if false;
     }
-
     match /queue_events/{id} {
-      allow create: if signedIn() && request.resource.data.actorId == request.auth.uid;
-      allow read: if isStaff();
+      allow read: if signedIn() && isAdmin();
+      allow write: if false;
+    }
+    match /settings/{id} {
+      allow read: if signedIn();
+      allow write: if false;
     }
   }
 }
