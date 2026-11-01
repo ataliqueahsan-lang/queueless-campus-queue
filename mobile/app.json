@@ -1,0 +1,13 @@
+{
+  "expo": {
+    "name": "QueueLess",
+    "slug": "queueless",
+    "scheme": "queueless",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "plugins": ["expo-router"],
+    "experiments": { "typedRoutes": false },
+    "web": { "bundler": "metro" }
+  }
+}
